@@ -194,7 +194,7 @@ func (g *generator) Pairs(ctx context.Context, conf *config.Config) []OutputPair
 }
 
 func (g *generator) ProcessResult(ctx context.Context, combo config.CombinedSettings, sql OutputPair, result *compiler.Result) error {
-	out, resp, err := codegen(ctx, combo, sql, result)
+	out, _, resp, err := codegen(ctx, combo, sql, result)
 	if err != nil {
 		return err
 	}
@@ -203,53 +203,65 @@ func (g *generator) ProcessResult(ctx context.Context, combo config.CombinedSett
 		files[file.Name] = string(file.Contents)
 	}
 	g.m.Lock()
-
-	// out is specified by the user, not a plugin
-	absout := filepath.Join(g.dir, out)
-
-	// When the Go codegen is configured to emit the models file into a
-	// separate package directory, route that file to its own absolute path.
-	// This is the only file allowed to live outside of `out`.
-	var (
-		modelsFileName string
-		modelsAbsout   string
-		modelsAbsfile  string
-	)
-	if sql.Gen.Go != nil && sql.Gen.Go.OutputModelsPath != "" && sql.Gen.Go.ModelsEmitEnabled() {
-		modelsFileName = sql.Gen.Go.OutputModelsFileName
-		if modelsFileName == "" {
-			modelsFileName = "models.go"
-		}
-		modelsAbsout = filepath.Join(g.dir, sql.Gen.Go.OutputModelsPath)
-		modelsAbsfile = filepath.Join(modelsAbsout, modelsFileName)
-	}
-
+	defer g.m.Unlock()
 	for n, source := range files {
-		if modelsFileName != "" && n == modelsFileName {
-			// Models file routed to a separate package directory.
-			if strings.Contains(modelsAbsfile, "..") {
-				return fmt.Errorf("invalid file output path: %s", modelsAbsfile)
-			}
-			if !strings.HasPrefix(modelsAbsfile, modelsAbsout) {
-				return fmt.Errorf("invalid file output path: %s", modelsAbsfile)
-			}
-			g.output[modelsAbsfile] = source
-			continue
-		}
-		filename := filepath.Join(g.dir, out, n)
-		// filepath.Join calls filepath.Clean which should remove all "..", but
-		// double check to make sure
-		if strings.Contains(filename, "..") {
-			return fmt.Errorf("invalid file output path: %s", filename)
-		}
-		// The output file must be contained inside the output directory
-		if !strings.HasPrefix(filename, absout) {
-			return fmt.Errorf("invalid file output path: %s", filename)
+		filename, err := outputFileAbsPath(g.dir, out, sql, n)
+		if err != nil {
+			return err
 		}
 		g.output[filename] = source
 	}
-	g.m.Unlock()
 	return nil
+}
+
+// outputFileAbsPath resolves the absolute path a generated file is written
+// to, applying the same containment checks for both the regular output
+// directory and the Go models file's separate package directory.
+func outputFileAbsPath(dir, out string, pair OutputPair, name string) (string, error) {
+	if pair.Gen.Go != nil && pair.Gen.Go.OutputModelsPath != "" && pair.Gen.Go.ModelsEmitEnabled() {
+		modelsFileName := pair.Gen.Go.OutputModelsFileName
+		if modelsFileName == "" {
+			modelsFileName = "models.go"
+		}
+		if name == modelsFileName {
+			// Models file routed to a separate package directory.
+			modelsAbsout := filepath.Join(dir, pair.Gen.Go.OutputModelsPath)
+			modelsAbsfile := filepath.Join(modelsAbsout, modelsFileName)
+			if strings.Contains(modelsAbsfile, "..") {
+				return "", fmt.Errorf("invalid file output path: %s", modelsAbsfile)
+			}
+			if !strings.HasPrefix(modelsAbsfile, modelsAbsout) {
+				return "", fmt.Errorf("invalid file output path: %s", modelsAbsfile)
+			}
+			return modelsAbsfile, nil
+		}
+	}
+	// out is specified by the user, not a plugin
+	absout := filepath.Join(dir, out)
+	filename := filepath.Join(absout, name)
+	// filepath.Join calls filepath.Clean which should remove all "..", but
+	// double check to make sure
+	if strings.Contains(filename, "..") {
+		return "", fmt.Errorf("invalid file output path: %s", filename)
+	}
+	// The output file must be contained inside the output directory
+	if !strings.HasPrefix(filename, absout) {
+		return "", fmt.Errorf("invalid file output path: %s", filename)
+	}
+	return filename, nil
+}
+
+// outputRoots returns the absolute directories a pair is allowed to emit
+// files into. The Go models file may live in its own package directory, so
+// that directory joins the regular output directory.
+func outputRoots(dir, out string, pair OutputPair) map[string]struct{} {
+	roots := map[string]struct{}{
+		filepath.Join(dir, out): {},
+	}
+	if pair.Gen.Go != nil && pair.Gen.Go.OutputModelsPath != "" && pair.Gen.Go.ModelsEmitEnabled() {
+		roots[filepath.Join(dir, pair.Gen.Go.OutputModelsPath)] = struct{}{}
+	}
+	return roots
 }
 
 func parse(ctx context.Context, name, dir string, sql config.SQL, combo config.CombinedSettings, parserOpts opts.Parser, stderr io.Writer) (*compiler.Result, bool) {
@@ -296,7 +308,7 @@ func parse(ctx context.Context, name, dir string, sql config.SQL, combo config.C
 	return c.Result(), false
 }
 
-func codegen(ctx context.Context, combo config.CombinedSettings, sql OutputPair, result *compiler.Result) (string, *plugin.GenerateResponse, error) {
+func codegen(ctx context.Context, combo config.CombinedSettings, sql OutputPair, result *compiler.Result) (string, *plugin.GenerateRequest, *plugin.GenerateResponse, error) {
 	defer trace.StartRegion(ctx, "codegen").End()
 	req := codeGenRequest(result, combo)
 	var handler grpc.ClientConnInterface
@@ -306,7 +318,7 @@ func codegen(ctx context.Context, combo config.CombinedSettings, sql OutputPair,
 		out = sql.Plugin.Out
 		plug, err := findPlugin(combo.Global, sql.Plugin.Plugin)
 		if err != nil {
-			return "", nil, fmt.Errorf("plugin not found: %s", err)
+			return "", nil, nil, fmt.Errorf("plugin not found: %s", err)
 		}
 
 		switch {
@@ -323,12 +335,12 @@ func codegen(ctx context.Context, combo config.CombinedSettings, sql OutputPair,
 				Env:    plug.Env,
 			}
 		default:
-			return "", nil, fmt.Errorf("unsupported plugin type")
+			return "", nil, nil, fmt.Errorf("unsupported plugin type")
 		}
 
 		opts, err := convert.YAMLtoJSON(sql.Plugin.Options)
 		if err != nil {
-			return "", nil, fmt.Errorf("invalid plugin options: %w", err)
+			return "", nil, nil, fmt.Errorf("invalid plugin options: %w", err)
 		}
 		req.PluginOptions = opts
 
@@ -336,7 +348,7 @@ func codegen(ctx context.Context, combo config.CombinedSettings, sql OutputPair,
 		if found {
 			opts, err := convert.YAMLtoJSON(global)
 			if err != nil {
-				return "", nil, fmt.Errorf("invalid global options: %w", err)
+				return "", nil, nil, fmt.Errorf("invalid global options: %w", err)
 			}
 			req.GlobalOptions = opts
 		}
@@ -346,14 +358,14 @@ func codegen(ctx context.Context, combo config.CombinedSettings, sql OutputPair,
 		handler = ext.HandleFunc(golang.Generate)
 		opts, err := json.Marshal(sql.Gen.Go)
 		if err != nil {
-			return "", nil, fmt.Errorf("opts marshal failed: %w", err)
+			return "", nil, nil, fmt.Errorf("opts marshal failed: %w", err)
 		}
 		req.PluginOptions = opts
 
 		if combo.Global.Overrides.Go != nil {
 			opts, err := json.Marshal(combo.Global.Overrides.Go)
 			if err != nil {
-				return "", nil, fmt.Errorf("opts marshal failed: %w", err)
+				return "", nil, nil, fmt.Errorf("opts marshal failed: %w", err)
 			}
 			req.GlobalOptions = opts
 		}
@@ -363,14 +375,14 @@ func codegen(ctx context.Context, combo config.CombinedSettings, sql OutputPair,
 		handler = ext.HandleFunc(genjson.Generate)
 		opts, err := json.Marshal(sql.Gen.JSON)
 		if err != nil {
-			return "", nil, fmt.Errorf("opts marshal failed: %w", err)
+			return "", nil, nil, fmt.Errorf("opts marshal failed: %w", err)
 		}
 		req.PluginOptions = opts
 
 	default:
-		return "", nil, fmt.Errorf("missing language backend")
+		return "", nil, nil, fmt.Errorf("missing language backend")
 	}
 	client := plugin.NewCodegenServiceClient(handler)
 	resp, err := client.Generate(ctx, req)
-	return out, resp, err
+	return out, req, resp, err
 }

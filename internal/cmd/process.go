@@ -21,6 +21,12 @@ type OutputPair struct {
 	Plugin *config.Codegen
 
 	config.SQL
+
+	// idx is the position of this pair within the slice returned by
+	// Pairs. It is set by result processors that need to correlate a
+	// result back to the pair it came from, like the generation record
+	// workflow; the default generator leaves it at the zero value.
+	idx int
 }
 
 type ResultProcessor interface {

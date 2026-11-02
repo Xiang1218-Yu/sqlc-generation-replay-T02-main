@@ -458,6 +458,14 @@
                     }
                 }
             }
+        },
+        "record": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string"
+                }
+            }
         }
     }
 }

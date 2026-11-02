@@ -69,6 +69,17 @@ type Config struct {
 	Plugins   []Plugin             `json:"plugins" yaml:"plugins"`
 	Rules     []Rule               `json:"rules" yaml:"rules"`
 	Options   map[string]yaml.Node `json:"options" yaml:"options"`
+	Record    RecordConfig         `json:"record,omitempty" yaml:"record,omitempty"`
+}
+
+// RecordConfig configures the opt-in generation record workflow, driven by
+// the `sqlc record update` and `sqlc record verify` commands. When the
+// workflow is not used, generate, diff, vet and verify behave exactly as
+// without this section.
+type RecordConfig struct {
+	// Path is the location of the generation record, relative to the
+	// configuration file directory. It defaults to .sqlc/record.json.
+	Path string `json:"path,omitempty" yaml:"path,omitempty"`
 }
 
 type Server struct {
